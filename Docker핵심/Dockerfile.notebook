@@ -1,0 +1,233 @@
+# Dockerfile.notebook - Project Odysseus 데이터 분석 전용 Jupyter 환경
+FROM jupyter/scipy-notebook:latest
+
+# 메타데이터
+LABEL maintainer="Project Odysseus Team"
+LABEL description="Data Analysis Environment for Trading Bot"
+
+# root 사용자로 전환 (패키지 설치용)
+USER root
+
+# 시스템 패키지 설치
+RUN apt-get update && apt-get install -y \
+    # 컴파일 도구
+    build-essential \
+    gcc \
+    g++ \
+    # PostgreSQL 클라이언트
+    libpq-dev \
+    # TA-Lib
+    libta-lib0-dev \
+    # 유틸리티
+    curl \
+    wget \
+    git \
+    vim \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# jovyan 사용자로 전환
+USER $NB_UID
+
+# Python 패키지 설치
+COPY requirements.txt /tmp/requirements.txt
+
+# 데이터 분석에 특화된 패키지들 추가 설치
+RUN pip install --no-cache-dir \
+    # 기본 requirements
+    -r /tmp/requirements.txt && \
+    # 추가 분석 도구들
+    pip install --no-cache-dir \
+    # 고급 시각화
+    plotly-dash \
+    bokeh \
+    altair \
+    # 시계열 분석
+    fbprophet \
+    pmdarima \
+    # 금융 분석
+    yfinance \
+    quantlib-python \
+    # 고성능 데이터 처리  
+    dask[complete] \
+    vaex \
+    # 백테스팅
+    backtrader \
+    zipline-reloaded \
+    # 통계 분석
+    pingouin \
+    # 네트워크 분석
+    networkx \
+    # 지도 시각화
+    folium \
+    geopandas \
+    # Jupyter 확장
+    jupyterlab-git \
+    jupyter-dash \
+    ipywidgets \
+    # TA-Lib (선택적)
+    && pip install --no-cache-dir TA-Lib || echo "TA-Lib installation failed"
+
+# Jupyter Lab 확장 설치
+RUN jupyter labextension install \
+    @jupyter-widgets/jupyterlab-manager \
+    plotlywidget \
+    jupyterlab-plotly \
+    || echo "Some extensions failed to install"
+
+# 작업 디렉토리 생성
+RUN mkdir -p /home/jovyan/work/notebooks \
+             /home/jovyan/work/data \
+             /home/jovyan/work/models \
+             /home/jovyan/work/results
+
+# Jupyter 설정 파일 생성
+RUN mkdir -p /home/jovyan/.jupyter
+
+# Jupyter 설정
+COPY <<EOF /home/jovyan/.jupyter/jupyter_notebook_config.py
+# Jupyter Notebook Configuration for Project Odysseus
+
+# 네트워크 설정
+c.NotebookApp.ip = '0.0.0.0'
+c.NotebookApp.port = 8888
+c.NotebookApp.allow_root = True
+c.NotebookApp.token = ''
+c.NotebookApp.password = ''
+
+# 보안 설정 (개발 환경용)
+c.NotebookApp.disable_check_xsrf = True
+c.NotebookApp.allow_origin = '*'
+c.NotebookApp.allow_credentials = True
+
+# 파일 관련 설정
+c.NotebookApp.open_browser = False
+c.NotebookApp.notebook_dir = '/home/jovyan/work'
+
+# 세션 설정
+c.NotebookApp.shutdown_no_activity_timeout = 7200  # 2시간
+
+# 확장 설정
+c.NotebookApp.nbserver_extensions = {
+    'jupyter_dash.server': True
+}
+EOF
+
+# JupyterLab 설정
+COPY <<EOF /home/jovyan/.jupyter/jupyter_lab_config.py
+# JupyterLab Configuration
+
+c.ServerApp.ip = '0.0.0.0'
+c.ServerApp.port = 8888
+c.ServerApp.allow_root = True
+c.ServerApp.token = ''
+c.ServerApp.password = ''
+c.ServerApp.disable_check_xsrf = True
+c.ServerApp.allow_origin = '*'
+c.ServerApp.open_browser = False
+c.ServerApp.root_dir = '/home/jovyan/work'
+EOF
+
+# 샘플 노트북 생성
+COPY <<EOF /home/jovyan/work/notebooks/01_data_exploration.ipynb
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Project Odysseus - 데이터 탐색\n",
+    "## 페어 트레이딩 데이터 분석 및 시각화"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "import plotly.graph_objects as go\n",
+    "import plotly.express as px\n",
+    "from plotly.subplots import make_subplots\n",
+    "import psycopg2\n",
+    "import ccxt\n",
+    "\n",
+    "# 데이터베이스 연결 설정\n",
+    "import os\n",
+    "DB_CONFIG = {\n",
+    "    'host': os.getenv('DB_HOST', 'timescaledb'),\n",
+    "    'port': os.getenv('DB_PORT', 5432),\n",
+    "    'database': os.getenv('DB_NAME', 'odysseus_trading'),\n",
+    "    'user': os.getenv('DB_USER', 'postgres'),\n",
+    "    'password': os.getenv('DB_PASSWORD', 'odysseus_secure_2024')\n",
+    "}\n",
+    "\n",
+    "print('🚀 Project Odysseus 분석 환경이 준비되었습니다!')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. 데이터베이스 연결 테스트"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# TimescaleDB 연결 테스트\n",
+    "try:\n",
+    "    conn = psycopg2.connect(**DB_CONFIG)\n",
+    "    cursor = conn.cursor()\n",
+    "    cursor.execute('SELECT version();')\n",
+    "    version = cursor.fetchone()[0]\n",
+    "    print(f'✅ 데이터베이스 연결 성공: {version}')\n",
+    "    cursor.close()\n",
+    "    conn.close()\n",
+    "except Exception as e:\n",
+    "    print(f'❌ 데이터베이스 연결 실패: {e}')"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
+EOF
+
+# 권한 설정
+RUN chown -R $NB_UID:$NB_GID /home/jovyan/
+
+# 포트 노출
+EXPOSE 8888
+
+# 작업 디렉토리 설정
+WORKDIR /home/jovyan/work
+
+# 시작 명령어
+CMD ["start-notebook.sh", \
+     "--NotebookApp.token=''", \
+     "--NotebookApp.password=''", \
+     "--NotebookApp.allow_root=True"]

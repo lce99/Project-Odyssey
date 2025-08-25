@@ -1,0 +1,410 @@
+# docker-compose.yml - Project Odysseus 통합 개발 환경
+# TimescaleDB + Trading Bot + Optional Services
+
+version: '3.8'
+
+# =============================================================================
+# 공통 설정 및 환경 변수
+# =============================================================================
+x-common-variables: &common-variables
+  TZ: UTC
+  PYTHONPATH: /app
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+# 공통 로그 설정
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+# 공통 재시작 정책
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+# =============================================================================
+# 네트워크 설정
+# =============================================================================
+networks:
+  odysseus-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# =============================================================================
+# 볼륨 설정
+# =============================================================================  
+volumes:
+  # TimescaleDB 데이터 영구 저장
+  timescaledb-data:
+    driver: local
+    
+  # 애플리케이션 로그
+  app-logs:
+    driver: local
+    
+  # 백테스트 결과 및 데이터
+  backtest-data:
+    driver: local
+    
+  # ML 모델 저장소
+  ml-models:
+    driver: local
+    
+  # Redis 데이터 (캐싱용)
+  redis-data:
+    driver: local
+
+# =============================================================================
+# 서비스 정의
+# =============================================================================
+services:
+  
+  # ---------------------------------------------------------------------------
+  # TimescaleDB (Primary Database)
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:2.14.2-pg15
+    container_name: odysseus-timescaledb
+    <<: *restart-policy
+    environment:
+      POSTGRES_DB: ${DB_NAME:-odysseus_trading}
+      POSTGRES_USER: ${DB_USER:-postgres}  
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-odysseus_secure_2024}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      # TimescaleDB 최적화 설정
+      POSTGRES_MAX_CONNECTIONS: ${POSTGRES_MAX_CONNECTIONS:-200}
+      POSTGRES_SHARED_BUFFERS: ${POSTGRES_SHARED_BUFFERS:-256MB}
+      POSTGRES_WORK_MEM: ${POSTGRES_WORK_MEM:-4MB}
+      POSTGRES_MAINTENANCE_WORK_MEM: 64MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 1GB
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./scripts/db/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./scripts/db/create-tables.sql:/docker-entrypoint-initdb.d/02-tables.sql:ro
+      - ./scripts/db/indexes.sql:/docker-entrypoint-initdb.d/03-indexes.sql:ro
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.10
+    logging: *default-logging
+    command: >
+      postgres
+      -c shared_preload_libraries=timescaledb
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
+      -c effective_cache_size=1GB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c log_statement=mod
+      -c log_min_duration_statement=1000
+      -c log_checkpoints=on
+      -c log_connections=on
+      -c log_disconnections=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-odysseus_trading}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Redis (Caching & Session Store)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: odysseus-redis
+    <<: *restart-policy
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.11
+    logging: *default-logging
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Trading Bot (Main Application)
+  # ---------------------------------------------------------------------------
+  trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        - INSTALL_DEV=false
+    image: odysseus:latest
+    container_name: odysseus-trading-bot
+    <<: *restart-policy
+    environment:
+      <<: *common-variables
+      # 데이터베이스 연결
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-odysseus_trading}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-odysseus_secure_2024}
+      
+      # Redis 연결
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      
+      # 애플리케이션 설정
+      TRADING_MODE: ${TRADING_MODE:-testnet}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      
+      # API 키들 (.env에서 로드)
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_SECRET_KEY: ${BINANCE_SECRET_KEY}
+      BYBIT_API_KEY: ${BYBIT_API_KEY}
+      BYBIT_SECRET_KEY: ${BYBIT_SECRET_KEY}
+      
+      # 알림 설정
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+    ports:
+      - "${DASHBOARD_PORT:-8000}:8000"
+    volumes:
+      - app-logs:/app/logs
+      - backtest-data:/app/data
+      - ml-models:/app/ml_models
+      - ./config.py:/app/config.py:ro
+      - ./.env:/app/.env:ro
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.20
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # Development Environment (Optional)
+  # ---------------------------------------------------------------------------
+  dev-environment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+      args:
+        - INSTALL_DEV=true
+    image: odysseus:dev
+    container_name: odysseus-dev
+    environment:
+      <<: *common-variables
+      DEVELOPMENT_MODE: "true"
+      LOG_LEVEL: DEBUG
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-odysseus_trading}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-odysseus_secure_2024}
+      REDIS_HOST: redis
+    ports:
+      - "8001:8000"  # 대시보드
+      - "8888:8888"  # Jupyter
+      - "5678:5678"  # 디버깅 포트
+    volumes:
+      - .:/app  # 실시간 코드 반영
+      - app-logs:/app/logs
+      - backtest-data:/app/data
+      - ml-models:/app/ml_models
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.21
+    depends_on:
+      - timescaledb
+      - redis
+    logging: *default-logging
+    # 개발 환경은 수동 시작
+    profiles:
+      - dev
+    command: >
+      bash -c "
+        echo 'Starting development environment...' &&
+        echo 'Jupyter Lab available at: http://localhost:8888' &&
+        echo 'Dashboard available at: http://localhost:8001' &&
+        jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root &
+        python main.py
+      "
+
+  # ---------------------------------------------------------------------------
+  # Monitoring & Observability
+  # ---------------------------------------------------------------------------
+  
+  # Grafana (대시보드)
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: odysseus-grafana
+    <<: *restart-policy
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-odysseus123}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.30
+    depends_on:
+      - timescaledb
+    logging: *default-logging
+    profiles:
+      - monitoring
+
+  # Prometheus (메트릭 수집)
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: odysseus-prometheus
+    <<: *restart-policy
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.31
+    logging: *default-logging
+    profiles:
+      - monitoring
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+
+  # ---------------------------------------------------------------------------
+  # Utilities & Tools
+  # ---------------------------------------------------------------------------
+  
+  # Adminer (데이터베이스 관리)
+  adminer:
+    image: adminer:4.8.1
+    container_name: odysseus-adminer
+    <<: *restart-policy
+    ports:
+      - "8080:8080"
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.40
+    depends_on:
+      - timescaledb
+    logging: *default-logging
+    profiles:
+      - tools
+
+  # Redis Commander (Redis 관리)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: odysseus-redis-commander
+    <<: *restart-policy
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    networks:
+      odysseus-network:
+        ipv4_address: 172.20.0.41
+    depends_on:
+      - redis
+    logging: *default-logging
+    profiles:
+      - tools
+
+  # Backup Service (데이터 백업)
+  backup:
+    image: postgres:15-alpine
+    container_name: odysseus-backup
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-odysseus_secure_2024}
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    networks:
+      - odysseus-network
+    depends_on:
+      - timescaledb
+    profiles:
+      - backup
+    # 매일 새벽 2시에 백업 실행
+    command: >
+      sh -c "
+        echo '0 2 * * * /backup.sh' | crontab -
+        crond -f
+      "
+
+# =============================================================================
+# 사용 가이드
+# =============================================================================
+
+# 기본 실행 (운영 환경):
+# docker-compose up -d
+
+# 개발 환경 실행:
+# docker-compose --profile dev up -d
+
+# 모니터링 포함 실행:
+# docker-compose --profile monitoring up -d
+
+# 모든 도구 포함 실행:
+# docker-compose --profile dev --profile monitoring --profile tools up -d
+
+# 특정 서비스만 실행:
+# docker-compose up -d timescaledb redis
+# docker-compose up -d trading-bot
+
+# 로그 확인:
+# docker-compose logs -f trading-bot
+# docker-compose logs -f timescaledb
+
+# 서비스 스케일링:
+# docker-compose up -d --scale trading-bot=2
+
+# 백업 실행:
+# docker-compose --profile backup run --rm backup
+
+# 정리:
+# docker-compose down -v  # 볼륨 포함 모두 삭제
+# docker-compose down     # 서비스만 중지
+
+# =============================================================================
+# 접속 정보
+# =============================================================================
+
+# 서비스 포트:
+# - Trading Bot Dashboard: http://localhost:8000
+# - Development Dashboard: http://localhost:8001  
+# - Jupyter Lab: http://localhost:8888
+# - Grafana: http://localhost:3000 (admin/odysseus123)
+# - Prometheus: http://localhost:9090
+# - Adminer: http://localhost:8080
+# - Redis Commander: http://localhost:8081
+# - TimescaleDB: localhost:5432
+# - Redis: localhost:6379
