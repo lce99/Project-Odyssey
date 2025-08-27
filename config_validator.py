@@ -67,7 +67,7 @@ class ConfigValidator:
         ]
         
         try:
-            import config
+            import config as config
             
             missing_configs = []
             for required in required_configs:
@@ -88,7 +88,7 @@ class ConfigValidator:
     def validate_data_types(self) -> bool:
         """데이터 타입 검증"""
         try:
-            import config
+            import config as config
             
             # 타입 검증 규칙
             type_rules = {
@@ -124,7 +124,7 @@ class ConfigValidator:
     def validate_config_values(self) -> bool:
         """설정값 논리 검증"""
         try:
-            import config
+            import config as config
             
             # 논리적 검증 규칙들
             validations = []
